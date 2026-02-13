@@ -62,6 +62,7 @@ echo "find all API endpoints" | cq
 | `-d <dir>` | `.` | Target project directory |
 | `-m <model>` | `haiku` | Model to use |
 | `-t <turns>` | `30` | Max agentic turns |
+| `--no-diagram` | off | Disable mermaid diagrams in output |
 | `--json` | off | Full JSON output with metadata |
 | `-s <prompt>` | built-in | Override the system prompt |
 | `-h` | — | Show help |
@@ -84,8 +85,12 @@ Add to your project's `CLAUDE.md`:
 
 Use `cq` for codebase questions before reading files directly:
   bash: cq "how does X work?"
+  bash: cq "trace the request lifecycle"  # may include mermaid diagrams
+  bash: cq --no-diagram "trace the request lifecycle"  # plain text only
 
 If the response contains NEEDS_MORE_EXPLORATION, run the suggested follow-up query.
+cq is stateless — each invocation starts fresh. The follow-up query already includes
+context about what was found, so the next run can skip known ground.
 ```
 
 Then the coding agent will naturally call `cq` via its Bash tool whenever it needs to understand code.
