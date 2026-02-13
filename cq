@@ -5,7 +5,7 @@ set -euo pipefail
 # A Claude Code wrapper that spawns haiku sub-agents to explore codebases.
 # Designed to be called by a coding agent's Bash tool to offload code understanding.
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 REPO_RAW_URL="https://raw.githubusercontent.com/kywch/cc-code-query-cli/main"
 
 # Resolve the real path of this script (follows symlinks)
@@ -64,6 +64,18 @@ TARGET_DIR="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 JSON_OUTPUT=false
 CUSTOM_SYSTEM_PROMPT=""
 QUERY=""
+
+# Format token counts with k/M suffix
+fmt_tokens() {
+  local n="$1"
+  if (( n >= 1000000 )); then
+    awk "BEGIN {printf \"%.1fM\", $n/1000000}"
+  elif (( n >= 1000 )); then
+    awk "BEGIN {printf \"%.1fk\", $n/1000}"
+  else
+    printf '%d' "$n"
+  fi
+}
 
 SYSTEM_PROMPT='You are a code exploration agent. Your job is to answer questions about a codebase concisely and accurately.
 
@@ -260,8 +272,14 @@ stop_progress
 # Parse the JSON response
 RESULT=$(echo "$RAW_OUTPUT" | jq -r '.result // empty')
 NUM_TURNS=$(echo "$RAW_OUTPUT" | jq -r '.num_turns // 0')
-COST=$(echo "$RAW_OUTPUT" | jq -r '.total_cost_usd // 0')
 ELAPSED=$(( SECONDS - START_TIME ))
+
+# Token usage
+INPUT_TOKENS=$(echo "$RAW_OUTPUT" | jq -r '.usage.input_tokens // 0')
+OUTPUT_TOKENS=$(echo "$RAW_OUTPUT" | jq -r '.usage.output_tokens // 0')
+CACHE_CREATION=$(echo "$RAW_OUTPUT" | jq -r '.usage.cache_creation_input_tokens // 0')
+CACHE_READ=$(echo "$RAW_OUTPUT" | jq -r '.usage.cache_read_input_tokens // 0')
+TOTAL_IN=$(( INPUT_TOKENS + CACHE_CREATION + CACHE_READ ))
 
 # Check if we hit the turn limit
 if [[ "$NUM_TURNS" -ge "$MAX_TURNS" ]]; then
@@ -295,12 +313,18 @@ NEEDS_MORE_EXPLORATION: <a specific follow-up query the user could run to contin
   stop_progress
 
   SUMMARY_RESULT=$(echo "$SUMMARY_OUTPUT" | jq -r '.result // empty')
-  SUMMARY_COST=$(echo "$SUMMARY_OUTPUT" | jq -r '.total_cost_usd // 0')
-  TOTAL_COST=$(echo "$COST $SUMMARY_COST" | awk '{printf "%.4f", $1 + $2}')
+  # Add summary pass tokens to totals
+  SUMMARY_OUT=$(echo "$SUMMARY_OUTPUT" | jq -r '.usage.output_tokens // 0')
+  SUMMARY_IN=$(echo "$SUMMARY_OUTPUT" | jq -r '((.usage.input_tokens // 0) + (.usage.cache_creation_input_tokens // 0) + (.usage.cache_read_input_tokens // 0))')
+  SUMMARY_CACHED=$(echo "$SUMMARY_OUTPUT" | jq -r '.usage.cache_read_input_tokens // 0')
+  TOTAL_IN=$(( TOTAL_IN + SUMMARY_IN ))
+  OUTPUT_TOKENS=$(( OUTPUT_TOKENS + SUMMARY_OUT ))
+  CACHE_READ=$(( CACHE_READ + SUMMARY_CACHED ))
   ELAPSED=$(( SECONDS - START_TIME ))
 
   if [[ "$QUIET" == false ]]; then
-    printf '\e[2mdone — %s turns, $%s, %ds\e[0m\n\n' "$NUM_TURNS" "$TOTAL_COST" "$ELAPSED" >&2
+    printf '\e[2mdone — %s turns, %ds, %s in / %s out / %s cached\e[0m\n\n' \
+      "$NUM_TURNS" "$ELAPSED" "$(fmt_tokens $TOTAL_IN)" "$(fmt_tokens $OUTPUT_TOKENS)" "$(fmt_tokens $CACHE_READ)" >&2
   fi
 
   if [[ "$JSON_OUTPUT" == true ]]; then
@@ -308,14 +332,14 @@ NEEDS_MORE_EXPLORATION: <a specific follow-up query the user could run to contin
     jq -n \
       --argjson raw "$RAW_OUTPUT" \
       --arg summary "$SUMMARY_RESULT" \
-      --arg summary_cost "$SUMMARY_COST" \
+      --argjson total_in "$TOTAL_IN" \
+      --argjson total_out "$OUTPUT_TOKENS" \
+      --argjson total_cached "$CACHE_READ" \
       '{
         type: "result",
         truncated: true,
         exploration_turns: $raw.num_turns,
-        exploration_cost_usd: $raw.total_cost_usd,
-        summary_cost_usd: ($summary_cost | tonumber),
-        total_cost_usd: (($raw.total_cost_usd // 0) + ($summary_cost | tonumber)),
+        usage: { input_tokens: $total_in, output_tokens: $total_out, cache_read_input_tokens: $total_cached },
         result: $summary,
         raw_exploration_result: $raw.result
       }'
@@ -325,7 +349,8 @@ NEEDS_MORE_EXPLORATION: <a specific follow-up query the user could run to contin
 else
   # Normal output — exploration completed within turn limit
   if [[ "$QUIET" == false ]]; then
-    printf '\e[2mdone — %s turns, $%s, %ds\e[0m\n\n' "$NUM_TURNS" "$COST" "$ELAPSED" >&2
+    printf '\e[2mdone — %s turns, %ds, %s in / %s out / %s cached\e[0m\n\n' \
+      "$NUM_TURNS" "$ELAPSED" "$(fmt_tokens $TOTAL_IN)" "$(fmt_tokens $OUTPUT_TOKENS)" "$(fmt_tokens $CACHE_READ)" >&2
   fi
 
   if [[ "$JSON_OUTPUT" == true ]]; then
