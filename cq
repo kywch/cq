@@ -1,0 +1,336 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# cq — Code Query CLI
+# A Claude Code wrapper that spawns haiku sub-agents to explore codebases.
+# Designed to be called by a coding agent's Bash tool to offload code understanding.
+
+VERSION="0.1.0"
+REPO_RAW_URL="https://raw.githubusercontent.com/kywch/cc-code-query-cli/main"
+
+# Resolve the real path of this script (follows symlinks)
+resolve_path() {
+  local target="$1"
+  while [[ -L "$target" ]]; do
+    local dir="$(cd "$(dirname "$target")" && pwd)"
+    target="$(readlink "$target")"
+    [[ "$target" != /* ]] && target="$dir/$target"
+  done
+  echo "$(cd "$(dirname "$target")" && pwd)/$(basename "$target")"
+}
+
+self_update() {
+  local self
+  self="$(resolve_path "$0")"
+  local old_version="$VERSION"
+
+  local tmp
+  tmp="$(mktemp)"
+  trap 'rm -f "$tmp"' RETURN
+
+  echo "Checking for updates..."
+  if ! curl -fsSL "${REPO_RAW_URL}/cq" -o "$tmp" 2>/dev/null; then
+    echo "Error: Failed to download update." >&2
+    exit 1
+  fi
+
+  local new_version
+  new_version="$(grep -m1 '^VERSION=' "$tmp" | cut -d'"' -f2)"
+
+  if [[ -z "$new_version" ]]; then
+    echo "Error: Could not parse version from remote script." >&2
+    exit 1
+  fi
+
+  if [[ "$old_version" == "$new_version" ]]; then
+    echo "Already up-to-date (v${old_version})."
+    exit 0
+  fi
+
+  if [[ ! -w "$self" ]]; then
+    echo "Error: No write permission to $self. Try: sudo cq --update" >&2
+    exit 1
+  fi
+
+  cp "$tmp" "$self"
+  chmod +x "$self"
+  echo "Updated: v${old_version} -> v${new_version}"
+}
+
+# Defaults
+MODEL="haiku"
+MAX_TURNS=30
+TARGET_DIR="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+JSON_OUTPUT=false
+CUSTOM_SYSTEM_PROMPT=""
+QUERY=""
+
+SYSTEM_PROMPT='You are a code exploration agent. Your job is to answer questions about a codebase concisely and accurately.
+
+## How to explore
+- Use Glob to find files by name patterns (e.g. "**/*.ts", "src/**/auth*")
+- Use Grep to search file contents (e.g. function names, imports, string literals)
+- Use Read to examine specific files
+- Use Task with subagent_type=Explore for broad searches across unfamiliar codebases
+- Plan your exploration before starting — identify the most likely locations first
+
+## Output format
+1. Start with a 1-2 sentence **summary** that directly answers the question
+2. Then provide **structured details**:
+   - File paths with line numbers (e.g. src/auth/middleware.ts:42)
+   - Relevant code snippets (keep them short — key lines only)
+   - Call chains or data flow if tracing execution
+3. Keep your total response under 200 lines
+
+## Constraints
+- Do NOT suggest changes or improvements
+- Do NOT write new code
+- Only explore and report what you find
+- Be precise: cite file paths and line numbers for every claim
+
+## Efficiency
+You have limited turns. Prioritize breadth-first:
+1. Find the key files first (Glob + Grep)
+2. Read the most relevant ones
+3. Dive deep only where needed
+4. If running low on turns, summarize what you have found so far rather than leaving the exploration incomplete'
+
+usage() {
+  cat <<'EOF'
+cq — Code Query CLI
+
+Usage: cq [options] "your question about the codebase"
+
+Options:
+  -d <dir>      Target project directory (default: current directory)
+  -m <model>    Model to use (default: haiku)
+  -t <turns>    Max agentic turns (default: 30)
+  -s <prompt>   Override system prompt
+  --json        Output full JSON response (includes metadata)
+  -h, --help    Show this help
+  -v, --version Show version
+  --update      Self-update to latest version
+
+Examples:
+  cq "how does the auth middleware work?"
+  cq -d /path/to/project "trace the request lifecycle"
+  cq -m sonnet "complex architectural question"
+  cq -t 50 "deep trace of payment flow"
+  echo "find all API endpoints" | cq
+
+Designed to be called by a coding agent via Bash tool:
+  bash: cq "where is UserService defined and what are its methods?"
+EOF
+}
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -d)
+      TARGET_DIR="$2"
+      shift 2
+      ;;
+    -m)
+      MODEL="$2"
+      shift 2
+      ;;
+    -t)
+      MAX_TURNS="$2"
+      shift 2
+      ;;
+    -s)
+      CUSTOM_SYSTEM_PROMPT="$2"
+      shift 2
+      ;;
+    --json)
+      JSON_OUTPUT=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -v|--version)
+      echo "cq $VERSION"
+      exit 0
+      ;;
+    --update)
+      self_update
+      exit 0
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      QUERY="$1"
+      shift
+      ;;
+  esac
+done
+
+# Read from stdin if no query argument
+if [[ -z "$QUERY" ]]; then
+  if [[ ! -t 0 ]]; then
+    QUERY=$(cat)
+  else
+    echo "Error: No query provided." >&2
+    echo "Usage: cq \"your question about the codebase\"" >&2
+    exit 1
+  fi
+fi
+
+# Validate target directory
+if [[ ! -d "$TARGET_DIR" ]]; then
+  echo "Error: Directory not found: $TARGET_DIR" >&2
+  exit 1
+fi
+
+# Check for claude CLI
+if ! command -v claude &>/dev/null; then
+  echo "Error: claude CLI not found. Install it first: https://docs.anthropic.com/en/docs/claude-code" >&2
+  exit 1
+fi
+
+# Check for jq
+if ! command -v jq &>/dev/null; then
+  echo "Error: jq not found. Install it: sudo apt install jq / brew install jq" >&2
+  exit 1
+fi
+
+# Use custom or default system prompt
+PROMPT="${CUSTOM_SYSTEM_PROMPT:-$SYSTEM_PROMPT}"
+
+# Resolve to absolute path
+TARGET_DIR="$(cd "$TARGET_DIR" && pwd)"
+
+# Progress indicator (prints to stderr, won't pollute stdout)
+QUIET=false
+[[ ! -t 1 ]] && QUIET=true  # silence progress when stdout is piped
+
+progress_pid=""
+
+start_progress() {
+  local label="$1"
+  if [[ "$QUIET" == true ]]; then return; fi
+  (
+    printf '\e[2m%s ' "$label" >&2
+    while true; do
+      printf '.' >&2
+      sleep 2
+    done
+  ) &
+  progress_pid=$!
+}
+
+stop_progress() {
+  if [[ -n "$progress_pid" ]]; then
+    kill "$progress_pid" 2>/dev/null
+    wait "$progress_pid" 2>/dev/null || true
+    progress_pid=""
+    printf '\e[0m\n' >&2
+  fi
+}
+
+trap stop_progress EXIT
+
+# Run the exploration
+PROJECT_NAME=$(basename "$TARGET_DIR")
+if [[ "$QUIET" == false ]]; then
+  printf '\e[1mcq\e[0m \e[2m— %s (%s, max %s turns)\e[0m\n' "$PROJECT_NAME" "$MODEL" "$MAX_TURNS" >&2
+fi
+start_progress "exploring"
+
+START_TIME=$SECONDS
+RAW_OUTPUT=$(cd "$TARGET_DIR" && claude -p \
+  --model "$MODEL" \
+  --allowedTools "Read Glob Grep Task" \
+  --system-prompt "$PROMPT" \
+  --max-turns "$MAX_TURNS" \
+  --output-format json \
+  "$QUERY" 2>/dev/null) || {
+    stop_progress
+    echo "Error: claude command failed." >&2
+    exit 1
+  }
+
+stop_progress
+
+# Parse the JSON response
+RESULT=$(echo "$RAW_OUTPUT" | jq -r '.result // empty')
+NUM_TURNS=$(echo "$RAW_OUTPUT" | jq -r '.num_turns // 0')
+COST=$(echo "$RAW_OUTPUT" | jq -r '.total_cost_usd // 0')
+ELAPSED=$(( SECONDS - START_TIME ))
+
+# Check if we hit the turn limit
+if [[ "$NUM_TURNS" -ge "$MAX_TURNS" ]]; then
+  if [[ "$QUIET" == false ]]; then
+    printf '\e[33m⚠ hit turn limit (%s/%s) — summarizing...\e[0m\n' "$NUM_TURNS" "$MAX_TURNS" >&2
+  fi
+
+  # Truncated — run a summary pass
+  SUMMARY_PROMPT="The following are partial code exploration findings from an agent that ran out of turns before completing its exploration. Summarize the findings concisely. At the end, on a new line, write:
+NEEDS_MORE_EXPLORATION: <a specific follow-up query the user could run to continue the exploration>"
+
+  start_progress "summarizing"
+  SUMMARY_OUTPUT=$(cd "$TARGET_DIR" && echo "$RESULT" | claude -p \
+    --model "$MODEL" \
+    --tools "" \
+    --system-prompt "$SUMMARY_PROMPT" \
+    --max-turns 1 \
+    --output-format json \
+    2>/dev/null) || {
+      stop_progress
+      # If summary fails, just output the raw result
+      if [[ "$JSON_OUTPUT" == true ]]; then
+        echo "$RAW_OUTPUT"
+      else
+        echo "$RESULT"
+        echo ""
+        echo "[truncated — hit $MAX_TURNS turn limit]"
+      fi
+      exit 0
+    }
+  stop_progress
+
+  SUMMARY_RESULT=$(echo "$SUMMARY_OUTPUT" | jq -r '.result // empty')
+  SUMMARY_COST=$(echo "$SUMMARY_OUTPUT" | jq -r '.total_cost_usd // 0')
+  TOTAL_COST=$(echo "$COST $SUMMARY_COST" | awk '{printf "%.4f", $1 + $2}')
+  ELAPSED=$(( SECONDS - START_TIME ))
+
+  if [[ "$QUIET" == false ]]; then
+    printf '\e[2mdone — %s turns, $%s, %ds\e[0m\n\n' "$NUM_TURNS" "$TOTAL_COST" "$ELAPSED" >&2
+  fi
+
+  if [[ "$JSON_OUTPUT" == true ]]; then
+    # Merge summary into a combined JSON response
+    jq -n \
+      --argjson raw "$RAW_OUTPUT" \
+      --arg summary "$SUMMARY_RESULT" \
+      --arg summary_cost "$SUMMARY_COST" \
+      '{
+        type: "result",
+        truncated: true,
+        exploration_turns: $raw.num_turns,
+        exploration_cost_usd: $raw.total_cost_usd,
+        summary_cost_usd: ($summary_cost | tonumber),
+        total_cost_usd: (($raw.total_cost_usd // 0) + ($summary_cost | tonumber)),
+        result: $summary,
+        raw_exploration_result: $raw.result
+      }'
+  else
+    echo "$SUMMARY_RESULT"
+  fi
+else
+  # Normal output — exploration completed within turn limit
+  if [[ "$QUIET" == false ]]; then
+    printf '\e[2mdone — %s turns, $%s, %ds\e[0m\n\n' "$NUM_TURNS" "$COST" "$ELAPSED" >&2
+  fi
+
+  if [[ "$JSON_OUTPUT" == true ]]; then
+    echo "$RAW_OUTPUT"
+  else
+    echo "$RESULT"
+  fi
+fi
