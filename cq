@@ -5,7 +5,7 @@ set -euo pipefail
 # A Claude Code wrapper that spawns haiku sub-agents to explore codebases.
 # Designed to be called by a coding agent's Bash tool to offload code understanding.
 
-VERSION="0.1.5"
+VERSION="0.2.0"
 REPO_RAW_URL="https://raw.githubusercontent.com/kywch/cq/main"
 
 # Resolve the real path of this script (follows symlinks)
@@ -65,6 +65,7 @@ JSON_OUTPUT=false
 NO_DIAGRAM=false
 CUSTOM_SYSTEM_PROMPT=""
 QUERY=""
+INTERACTIVE=false
 
 # Format token counts with k/M suffix
 fmt_tokens() {
@@ -123,11 +124,18 @@ If the answer involves architecture, data flow, call chains, or component relati
 include a mermaid diagram. Skip the diagram for simple lookups (e.g. "where is X defined?").
 Keep diagrams small — under 20 lines.'
 
+INTERACTIVE_PROMPT='
+## Interactive session
+Focus on the current question. Previous exploration context from this session
+is available but may not be relevant to the current question.
+Explore the codebase fresh for each question rather than relying on prior findings.'
+
 usage() {
   cat <<'EOF'
 cq — Code Query CLI
 
 Usage: cq [options] "your question about the codebase"
+       cq [options]                  (interactive mode)
 
 Options:
   -d <dir>      Target project directory (default: current directory)
@@ -136,6 +144,7 @@ Options:
   -s <prompt>   Override system prompt
   --no-diagram  Disable mermaid diagrams in output
   --json        Output full JSON response (includes metadata)
+  -i             Enter interactive mode (REPL)
   -h, --help    Show this help
   -v, --version Show version
   --update      Self-update to latest version
@@ -146,6 +155,8 @@ Examples:
   cq -m sonnet "complex architectural question"
   cq -t 50 "deep trace of payment flow"
   echo "find all API endpoints" | cq
+  cq                              Enter interactive mode
+  cq -m sonnet -i                 Interactive mode with sonnet
 
 Designed to be called by a coding agent via Bash tool:
   bash: cq "where is UserService defined and what are its methods?"
@@ -179,6 +190,10 @@ while [[ $# -gt 0 ]]; do
       NO_DIAGRAM=true
       shift
       ;;
+    -i|--interactive)
+      INTERACTIVE=true
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -205,47 +220,61 @@ done
 
 # Read from stdin if no query argument
 if [[ -z "$QUERY" ]]; then
-  if [[ ! -t 0 ]]; then
+  if [[ "$INTERACTIVE" == true ]]; then
+    : # -i flag was passed explicitly, skip stdin reading
+  elif [[ ! -t 0 ]]; then
     QUERY=$(cat)
   else
-    echo "Error: No query provided." >&2
-    echo "Usage: cq \"your question about the codebase\"" >&2
-    exit 1
+    # No query, TTY stdin → enter interactive mode
+    INTERACTIVE=true
   fi
 fi
 
-# Validate target directory
-if [[ ! -d "$TARGET_DIR" ]]; then
-  echo "Error: Directory not found: $TARGET_DIR" >&2
+# Guard: --json is incompatible with interactive mode
+if [[ "$INTERACTIVE" == true && "$JSON_OUTPUT" == true ]]; then
+  echo "Error: --json is not compatible with interactive mode." >&2
   exit 1
 fi
 
-# Check for claude CLI
-if ! command -v claude &>/dev/null; then
-  echo "Error: claude CLI not found. Install it first: https://docs.anthropic.com/en/docs/claude-code" >&2
-  exit 1
-fi
+# Validate environment
+validate_env() {
+  if [[ ! -d "$TARGET_DIR" ]]; then
+    echo "Error: Directory not found: $TARGET_DIR" >&2
+    exit 1
+  fi
+  if ! command -v claude &>/dev/null; then
+    echo "Error: claude CLI not found. Install it first: https://docs.anthropic.com/en/docs/claude-code" >&2
+    exit 1
+  fi
+  if ! command -v jq &>/dev/null; then
+    echo "Error: jq not found. Install it: sudo apt install jq / brew install jq" >&2
+    exit 1
+  fi
+}
 
-# Check for jq
-if ! command -v jq &>/dev/null; then
-  echo "Error: jq not found. Install it: sudo apt install jq / brew install jq" >&2
-  exit 1
-fi
-
-# Use custom or default system prompt
-PROMPT="${CUSTOM_SYSTEM_PROMPT:-$SYSTEM_PROMPT}"
-
-# Append diagram instructions unless --no-diagram is set
-if [[ "$NO_DIAGRAM" == false ]]; then
-  PROMPT="${PROMPT}${DIAGRAM_PROMPT}"
-fi
+# Build the system prompt
+setup_prompt() {
+  PROMPT="${CUSTOM_SYSTEM_PROMPT:-$SYSTEM_PROMPT}"
+  if [[ "$NO_DIAGRAM" == false ]]; then
+    PROMPT="${PROMPT}${DIAGRAM_PROMPT}"
+  fi
+  if [[ "$INTERACTIVE" == true ]]; then
+    PROMPT="${PROMPT}${INTERACTIVE_PROMPT}"
+  fi
+}
 
 # Resolve to absolute path
 TARGET_DIR="$(cd "$TARGET_DIR" && pwd)"
+PROJECT_NAME=$(basename "$TARGET_DIR")
+
+validate_env
+setup_prompt
 
 # Progress indicator (prints to stderr, won't pollute stdout)
 QUIET=false
-[[ ! -t 1 ]] && QUIET=true  # silence progress when stdout is piped
+if [[ "$INTERACTIVE" == false ]]; then
+  [[ ! -t 1 ]] && QUIET=true  # silence progress when stdout is piped
+fi
 
 progress_pid=""
 
@@ -273,56 +302,59 @@ stop_progress() {
 
 trap stop_progress EXIT
 
-# Run the exploration
-PROJECT_NAME=$(basename "$TARGET_DIR")
-if [[ "$QUIET" == false ]]; then
-  printf '\e[1mcq\e[0m \e[2m— %s (%s, max %s turns)\e[0m\n' "$PROJECT_NAME" "$MODEL" "$MAX_TURNS" >&2
-fi
-start_progress "exploring"
+# =============================================================================
+# Single-query mode (existing behavior, unchanged)
+# =============================================================================
 
-START_TIME=$SECONDS
-RAW_OUTPUT=$(cd "$TARGET_DIR" && claude -p \
-  --model "$MODEL" \
-  --allowedTools "Read Glob Grep Task" \
-  --system-prompt "$PROMPT" \
-  --max-turns "$MAX_TURNS" \
-  --output-format json \
-  "$QUERY" 2>/dev/null) || {
-    stop_progress
-    echo "Error: claude command failed." >&2
-    exit 1
-  }
-
-stop_progress
-
-# Parse the JSON response
-RESULT=$(echo "$RAW_OUTPUT" | jq -r '.result // empty')
-SESSION_ID=$(echo "$RAW_OUTPUT" | jq -r '.session_id // empty')
-NUM_TURNS=$(echo "$RAW_OUTPUT" | jq -r '.num_turns // 0')
-ELAPSED=$(( SECONDS - START_TIME ))
-
-# Token usage
-INPUT_TOKENS=$(echo "$RAW_OUTPUT" | jq -r '.usage.input_tokens // 0')
-OUTPUT_TOKENS=$(echo "$RAW_OUTPUT" | jq -r '.usage.output_tokens // 0')
-CACHE_CREATION=$(echo "$RAW_OUTPUT" | jq -r '.usage.cache_creation_input_tokens // 0')
-CACHE_READ=$(echo "$RAW_OUTPUT" | jq -r '.usage.cache_read_input_tokens // 0')
-TOTAL_IN=$(( INPUT_TOKENS + CACHE_CREATION + CACHE_READ ))
-
-# Check if we hit the turn limit
-if [[ "$NUM_TURNS" -ge "$MAX_TURNS" ]]; then
+run_single_query() {
   if [[ "$QUIET" == false ]]; then
-    printf '\e[33m⚠ hit turn limit — summarizing...\e[0m\n' >&2
+    printf '\e[1mcq\e[0m \e[2m— %s (%s, max %s turns)\e[0m\n' "$PROJECT_NAME" "$MODEL" "$MAX_TURNS" >&2
   fi
+  start_progress "exploring"
 
-  # Truncated — run a summary pass
-  DIAGRAM_RULE=""
-  if [[ "$NO_DIAGRAM" == false ]]; then
-    DIAGRAM_RULE="
+  START_TIME=$SECONDS
+  RAW_OUTPUT=$(cd "$TARGET_DIR" && claude -p \
+    --model "$MODEL" \
+    --allowedTools "Read Glob Grep Task" \
+    --system-prompt "$PROMPT" \
+    --max-turns "$MAX_TURNS" \
+    --output-format json \
+    "$QUERY" 2>/dev/null) || {
+      stop_progress
+      echo "Error: claude command failed." >&2
+      exit 1
+    }
+
+  stop_progress
+
+  # Parse the JSON response
+  RESULT=$(echo "$RAW_OUTPUT" | jq -r '.result // empty')
+  SESSION_ID=$(echo "$RAW_OUTPUT" | jq -r '.session_id // empty')
+  NUM_TURNS=$(echo "$RAW_OUTPUT" | jq -r '.num_turns // 0')
+  ELAPSED=$(( SECONDS - START_TIME ))
+
+  # Token usage
+  INPUT_TOKENS=$(echo "$RAW_OUTPUT" | jq -r '.usage.input_tokens // 0')
+  OUTPUT_TOKENS=$(echo "$RAW_OUTPUT" | jq -r '.usage.output_tokens // 0')
+  CACHE_CREATION=$(echo "$RAW_OUTPUT" | jq -r '.usage.cache_creation_input_tokens // 0')
+  CACHE_READ=$(echo "$RAW_OUTPUT" | jq -r '.usage.cache_read_input_tokens // 0')
+  TOTAL_IN=$(( INPUT_TOKENS + CACHE_CREATION + CACHE_READ ))
+
+  # Check if we hit the turn limit
+  if [[ "$NUM_TURNS" -ge "$MAX_TURNS" ]]; then
+    if [[ "$QUIET" == false ]]; then
+      printf '\e[33m⚠ hit turn limit — summarizing...\e[0m\n' >&2
+    fi
+
+    # Truncated — run a summary pass
+    DIAGRAM_RULE=""
+    if [[ "$NO_DIAGRAM" == false ]]; then
+      DIAGRAM_RULE="
 - If the findings reveal architecture, data flow, or component \
 relationships, include a mermaid diagram (under 20 lines)"
-  fi
+    fi
 
-  SUMMARY_QUERY="You ran out of turns. Summarize your findings concisely. \
+    SUMMARY_QUERY="You ran out of turns. Summarize your findings concisely. \
 Only include information from code you actually read — no general knowledge.
 
 Rules:
@@ -334,75 +366,340 @@ CONTINUE_EXPLORATION: <query that includes brief context of what \
 was already found and which files were examined, so the next run \
 can skip known ground and focus on unanswered parts>"
 
-  start_progress "summarizing"
-  SUMMARY_OUTPUT=$(cd "$TARGET_DIR" && claude -p \
-    --resume "$SESSION_ID" \
-    --model "$MODEL" \
-    --disallowedTools "Read Glob Grep Task Bash Edit Write" \
-    --max-turns 2 \
-    --output-format json \
-    "$SUMMARY_QUERY" \
-    2>/dev/null) || {
-      stop_progress
-      # If summary fails, just output the raw result
-      if [[ "$JSON_OUTPUT" == true ]]; then
-        echo "$RAW_OUTPUT"
-      else
-        echo "$RESULT"
-        echo ""
-        echo "[truncated — hit $MAX_TURNS turn limit]"
-      fi
-      exit 0
-    }
+    start_progress "summarizing"
+    SUMMARY_OUTPUT=$(cd "$TARGET_DIR" && claude -p \
+      --resume "$SESSION_ID" \
+      --model "$MODEL" \
+      --disallowedTools "Read Glob Grep Task Bash Edit Write" \
+      --max-turns 2 \
+      --output-format json \
+      "$SUMMARY_QUERY" \
+      2>/dev/null) || {
+        stop_progress
+        # If summary fails, just output the raw result
+        if [[ "$JSON_OUTPUT" == true ]]; then
+          echo "$RAW_OUTPUT"
+        else
+          echo "$RESULT"
+          echo ""
+          echo "[truncated — hit $MAX_TURNS turn limit]"
+        fi
+        exit 0
+      }
+    stop_progress
+
+    SUMMARY_RESULT=$(echo "$SUMMARY_OUTPUT" | jq -r '.result // empty')
+    # Add summary pass tokens to totals
+    SUMMARY_OUT=$(echo "$SUMMARY_OUTPUT" | jq -r '.usage.output_tokens // 0')
+    SUMMARY_IN=$(echo "$SUMMARY_OUTPUT" | jq -r \
+      '((.usage.input_tokens // 0)
+        + (.usage.cache_creation_input_tokens // 0)
+        + (.usage.cache_read_input_tokens // 0))')
+    SUMMARY_CACHED=$(echo "$SUMMARY_OUTPUT" | jq -r '.usage.cache_read_input_tokens // 0')
+    TOTAL_IN=$(( TOTAL_IN + SUMMARY_IN ))
+    OUTPUT_TOKENS=$(( OUTPUT_TOKENS + SUMMARY_OUT ))
+    CACHE_READ=$(( CACHE_READ + SUMMARY_CACHED ))
+    ELAPSED=$(( SECONDS - START_TIME ))
+
+    if [[ "$QUIET" == false ]]; then
+      printf '\e[2mdone — %s turns, %ds, %s in / %s out / %s cached\e[0m\n\n' \
+        "$NUM_TURNS" "$ELAPSED" "$(fmt_tokens $TOTAL_IN)" "$(fmt_tokens $OUTPUT_TOKENS)" "$(fmt_tokens $CACHE_READ)" >&2
+    fi
+
+    if [[ "$JSON_OUTPUT" == true ]]; then
+      # Merge summary into a combined JSON response
+      jq -n \
+        --argjson raw "$RAW_OUTPUT" \
+        --arg summary "$SUMMARY_RESULT" \
+        --argjson total_in "$TOTAL_IN" \
+        --argjson total_out "$OUTPUT_TOKENS" \
+        --argjson total_cached "$CACHE_READ" \
+        '{
+          type: "result",
+          truncated: true,
+          exploration_turns: $raw.num_turns,
+          usage: { input_tokens: $total_in, output_tokens: $total_out, cache_read_input_tokens: $total_cached },
+          result: $summary,
+          raw_exploration_result: $raw.result
+        }'
+    else
+      echo "$SUMMARY_RESULT"
+    fi
+  else
+    # Normal output — exploration completed within turn limit
+    if [[ "$QUIET" == false ]]; then
+      printf '\e[2mdone — %s turns, %ds, %s in / %s out / %s cached\e[0m\n\n' \
+        "$NUM_TURNS" "$ELAPSED" "$(fmt_tokens $TOTAL_IN)" "$(fmt_tokens $OUTPUT_TOKENS)" "$(fmt_tokens $CACHE_READ)" >&2
+    fi
+
+    if [[ "$JSON_OUTPUT" == true ]]; then
+      echo "$RAW_OUTPUT"
+    else
+      echo "$RESULT"
+    fi
+  fi
+}
+
+# =============================================================================
+# Interactive mode (REPL)
+# =============================================================================
+
+# Session state (global so run_repl_query can update them)
+REPL_SESSION_ID=""
+REPL_TOTAL_IN=0
+REPL_TOTAL_OUT=0
+REPL_TOTAL_CACHED=0
+REPL_TOTAL_QUERIES=0
+REPL_SESSION_START=0
+
+print_repl_help() {
+  cat <<'EOF'
+Commands:
+  /new     Reset session (start fresh, forget previous context)
+  /stats   Show session statistics
+  /help    Show this help
+  /quit    Exit (or press Ctrl-D)
+EOF
+}
+
+print_session_stats() {
+  local elapsed=$(( SECONDS - REPL_SESSION_START ))
+  local mins=$(( elapsed / 60 ))
+  local secs=$(( elapsed % 60 ))
+  printf '\e[2m'
+  if (( mins > 0 )); then
+    printf 'session: %d queries, %dm %ds\n' "$REPL_TOTAL_QUERIES" "$mins" "$secs"
+  else
+    printf 'session: %d queries, %ds\n' "$REPL_TOTAL_QUERIES" "$secs"
+  fi
+  printf 'tokens:  %s in / %s out / %s cached\n' \
+    "$(fmt_tokens $REPL_TOTAL_IN)" \
+    "$(fmt_tokens $REPL_TOTAL_OUT)" \
+    "$(fmt_tokens $REPL_TOTAL_CACHED)"
+  printf '\e[0m'
+}
+
+# Run a single query in interactive mode (with --resume support)
+run_repl_query() {
+  local query="$1"
+  local retry="${2:-false}"
+
+  start_progress "exploring"
+  local start_time=$SECONDS
+
+  # Build claude command
+  local -a cmd=(claude -p
+    --model "$MODEL"
+    --allowedTools "Read Glob Grep Task"
+    --system-prompt "$PROMPT"
+    --max-turns "$MAX_TURNS"
+    --output-format json
+  )
+  [[ -n "$REPL_SESSION_ID" ]] && cmd+=(--resume "$REPL_SESSION_ID")
+  cmd+=("$query")
+
+  # Run (with error capture since set +e is active in the REPL)
+  local raw_output="" exit_code=0
+  raw_output=$(cd "$TARGET_DIR" && "${cmd[@]}" 2>/dev/null) || exit_code=$?
+
   stop_progress
 
-  SUMMARY_RESULT=$(echo "$SUMMARY_OUTPUT" | jq -r '.result // empty')
-  # Add summary pass tokens to totals
-  SUMMARY_OUT=$(echo "$SUMMARY_OUTPUT" | jq -r '.usage.output_tokens // 0')
-  SUMMARY_IN=$(echo "$SUMMARY_OUTPUT" | jq -r \
-    '((.usage.input_tokens // 0)
-      + (.usage.cache_creation_input_tokens // 0)
-      + (.usage.cache_read_input_tokens // 0))')
-  SUMMARY_CACHED=$(echo "$SUMMARY_OUTPUT" | jq -r '.usage.cache_read_input_tokens // 0')
-  TOTAL_IN=$(( TOTAL_IN + SUMMARY_IN ))
-  OUTPUT_TOKENS=$(( OUTPUT_TOKENS + SUMMARY_OUT ))
-  CACHE_READ=$(( CACHE_READ + SUMMARY_CACHED ))
-  ELAPSED=$(( SECONDS - START_TIME ))
-
-  if [[ "$QUIET" == false ]]; then
-    printf '\e[2mdone — %s turns, %ds, %s in / %s out / %s cached\e[0m\n\n' \
-      "$NUM_TURNS" "$ELAPSED" "$(fmt_tokens $TOTAL_IN)" "$(fmt_tokens $OUTPUT_TOKENS)" "$(fmt_tokens $CACHE_READ)" >&2
+  if [[ $exit_code -ne 0 ]]; then
+    if [[ $exit_code -eq 130 || $exit_code -eq 137 ]]; then
+      printf '\e[33minterrupted\e[0m\n' >&2
+      return 0
+    elif [[ -n "$REPL_SESSION_ID" && "$retry" != true ]]; then
+      printf '\e[33mSession expired — starting fresh.\e[0m\n' >&2
+      REPL_SESSION_ID=""
+      run_repl_query "$query" true
+      return
+    else
+      printf '\e[31mError: claude command failed (exit %d).\e[0m\n' "$exit_code" >&2
+      return 0
+    fi
   fi
 
-  if [[ "$JSON_OUTPUT" == true ]]; then
-    # Merge summary into a combined JSON response
-    jq -n \
-      --argjson raw "$RAW_OUTPUT" \
-      --arg summary "$SUMMARY_RESULT" \
-      --argjson total_in "$TOTAL_IN" \
-      --argjson total_out "$OUTPUT_TOKENS" \
-      --argjson total_cached "$CACHE_READ" \
-      '{
-        type: "result",
-        truncated: true,
-        exploration_turns: $raw.num_turns,
-        usage: { input_tokens: $total_in, output_tokens: $total_out, cache_read_input_tokens: $total_cached },
-        result: $summary,
-        raw_exploration_result: $raw.result
-      }'
-  else
-    echo "$SUMMARY_RESULT"
+  # Parse response
+  local result num_turns elapsed
+  result=$(echo "$raw_output" | jq -r '.result // empty')
+  REPL_SESSION_ID=$(echo "$raw_output" | jq -r '.session_id // empty')
+  num_turns=$(echo "$raw_output" | jq -r '.num_turns // 0')
+  elapsed=$(( SECONDS - start_time ))
+
+  local input_tokens output_tokens cache_creation cache_read total_in
+  input_tokens=$(echo "$raw_output" | jq -r '.usage.input_tokens // 0')
+  output_tokens=$(echo "$raw_output" | jq -r '.usage.output_tokens // 0')
+  cache_creation=$(echo "$raw_output" | jq -r '.usage.cache_creation_input_tokens // 0')
+  cache_read=$(echo "$raw_output" | jq -r '.usage.cache_read_input_tokens // 0')
+  total_in=$(( input_tokens + cache_creation + cache_read ))
+
+  # Handle turn limit
+  if [[ "$num_turns" -ge "$MAX_TURNS" ]]; then
+    printf '\e[33mhit turn limit — summarizing...\e[0m\n' >&2
+
+    local diagram_rule=""
+    if [[ "$NO_DIAGRAM" == false ]]; then
+      diagram_rule="
+- If the findings reveal architecture, data flow, or component \
+relationships, include a mermaid diagram (under 20 lines)"
+    fi
+
+    local summary_query="You ran out of turns. Summarize your findings concisely. \
+Only include information from code you actually read — no general knowledge.
+
+Rules:
+- List the specific files examined (with line numbers where available)
+- Keep the summary under 80 lines. Use tables or bullet lists, not prose${diagram_rule}
+- At the end, add a note:
+*Exploration was truncated due to turn limit. Ask a follow-up to continue exploring.*"
+
+    start_progress "summarizing"
+    local summary_output="" summary_exit=0
+    summary_output=$(cd "$TARGET_DIR" && claude -p \
+      --resume "$REPL_SESSION_ID" \
+      --model "$MODEL" \
+      --disallowedTools "Read Glob Grep Task Bash Edit Write" \
+      --max-turns 2 \
+      --output-format json \
+      "$summary_query" 2>/dev/null) || summary_exit=$?
+    stop_progress
+
+    if [[ $summary_exit -eq 0 && -n "$summary_output" ]]; then
+      result=$(echo "$summary_output" | jq -r '.result // empty')
+      local summary_out summary_in summary_cached
+      summary_out=$(echo "$summary_output" | jq -r '.usage.output_tokens // 0')
+      summary_in=$(echo "$summary_output" | jq -r \
+        '((.usage.input_tokens // 0)
+          + (.usage.cache_creation_input_tokens // 0)
+          + (.usage.cache_read_input_tokens // 0))')
+      summary_cached=$(echo "$summary_output" | jq -r '.usage.cache_read_input_tokens // 0')
+      total_in=$(( total_in + summary_in ))
+      output_tokens=$(( output_tokens + summary_out ))
+      cache_read=$(( cache_read + summary_cached ))
+      elapsed=$(( SECONDS - start_time ))
+    fi
   fi
+
+  # Print per-query stats
+  printf '\e[2mdone — %s turns, %ds, %s in / %s out / %s cached\e[0m\n\n' \
+    "$num_turns" "$elapsed" "$(fmt_tokens $total_in)" "$(fmt_tokens $output_tokens)" "$(fmt_tokens $cache_read)" >&2
+
+  # Print result
+  echo "$result"
+  echo ""
+
+  # Update session accumulators
+  REPL_TOTAL_IN=$(( REPL_TOTAL_IN + total_in ))
+  REPL_TOTAL_OUT=$(( REPL_TOTAL_OUT + output_tokens ))
+  REPL_TOTAL_CACHED=$(( REPL_TOTAL_CACHED + cache_read ))
+  REPL_TOTAL_QUERIES=$(( REPL_TOTAL_QUERIES + 1 ))
+}
+
+run_interactive() {
+  # Disable errexit for the REPL loop — errors are handled explicitly
+  set +e
+
+  REPL_SESSION_START=$SECONDS
+  local interrupted=false
+
+  # Enable readline history
+  set -o history 2>/dev/null || true
+  HISTFILE="${HOME}/.cq_history"
+  HISTSIZE=500
+  history -r "$HISTFILE" 2>/dev/null || true
+
+  # Print banner
+  printf '\e[1mcq\e[0m v%s — interactive mode (%s, max %s turns/query)\n' \
+    "$VERSION" "$MODEL" "$MAX_TURNS"
+  printf '\e[2mproject: %s (%s)\e[0m\n' "$PROJECT_NAME" "$TARGET_DIR"
+  printf '\e[2mtype /help for commands, /quit or Ctrl-D to exit\e[0m\n\n'
+
+  # REPL loop
+  while true; do
+    interrupted=false
+
+    # During prompt: trap SIGINT to set flag (re-prompt on Ctrl-C)
+    trap 'interrupted=true; printf "\n"' INT
+
+    printf '\e[1mcq\e[0m \e[2m(%s)\e[0m %s > ' "$MODEL" "$PROJECT_NAME"
+
+    if ! IFS= read -e -r input; then
+      if [[ "$interrupted" == true ]]; then
+        continue
+      fi
+      # EOF (Ctrl-D)
+      echo ""
+      break
+    fi
+
+    # Trim whitespace
+    input="${input#"${input%%[![:space:]]*}"}"
+    input="${input%"${input##*[![:space:]]}"}"
+    [[ -z "$input" ]] && continue
+
+    # Add to readline history
+    history -s "$input" 2>/dev/null || true
+
+    # Handle REPL commands
+    case "$input" in
+      /new)
+        REPL_SESSION_ID=""
+        REPL_TOTAL_IN=0
+        REPL_TOTAL_OUT=0
+        REPL_TOTAL_CACHED=0
+        REPL_TOTAL_QUERIES=0
+        REPL_SESSION_START=$SECONDS
+        printf '\e[2mSession reset.\e[0m\n\n'
+        continue
+        ;;
+      /quit)
+        break
+        ;;
+      /stats)
+        print_session_stats
+        echo ""
+        continue
+        ;;
+      /help)
+        print_repl_help
+        echo ""
+        continue
+        ;;
+      /*)
+        printf 'Unknown command: %s — type /help for commands.\n\n' "$input"
+        continue
+        ;;
+    esac
+
+    # During query: trap SIGINT to set flag (child processes still get killed)
+    trap 'interrupted=true' INT
+    run_repl_query "$input"
+
+    if [[ "$interrupted" == true ]]; then
+      interrupted=false
+    fi
+  done
+
+  trap - INT
+
+  # Save readline history
+  history -w "$HISTFILE" 2>/dev/null || true
+
+  # Print exit stats
+  if (( REPL_TOTAL_QUERIES > 0 )); then
+    print_session_stats
+  fi
+  printf 'bye.\n'
+
+  set -e
+}
+
+# =============================================================================
+# Main dispatch
+# =============================================================================
+
+if [[ "$INTERACTIVE" == true ]]; then
+  run_interactive
 else
-  # Normal output — exploration completed within turn limit
-  if [[ "$QUIET" == false ]]; then
-    printf '\e[2mdone — %s turns, %ds, %s in / %s out / %s cached\e[0m\n\n' \
-      "$NUM_TURNS" "$ELAPSED" "$(fmt_tokens $TOTAL_IN)" "$(fmt_tokens $OUTPUT_TOKENS)" "$(fmt_tokens $CACHE_READ)" >&2
-  fi
-
-  if [[ "$JSON_OUTPUT" == true ]]; then
-    echo "$RAW_OUTPUT"
-  else
-    echo "$RESULT"
-  fi
+  run_single_query
 fi
