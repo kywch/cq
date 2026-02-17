@@ -1,0 +1,70 @@
+how can i embed logo to readme?
+
+---
+
+yes, 400px width
+
+---
+
+maybe 200px
+
+---
+
+the preview broke
+
+---
+
+does readme overall look good?
+
+---
+
+i want to credit Sun-U Choe for creating the logo
+
+---
+
+is this enough for logo copyright?
+
+---
+
+i want the through approach
+
+---
+
+two suggestions from other agent:
+
+1. The "Notice" in the License File
+
+Most people only read the LICENSE file, not the README. If your LICENSE file is just the standard MIT text, it technically claims everything in the repo is MIT.
+
+The Fix: Open your LICENSE file and add a note at the bottom:
+
+    Note on Graphics: The logo (cq_logo.png) is © Sun-U Choe and is not covered by the MIT License. All rights reserved by the author.
+
+4. Alt-Text Refinement
+
+In your README's HTML snippet:
+HTML
+
+<img src="cq_logo.png" alt="CQ Logo" width="200">
+
+To be extra thorough regarding the credit, you could change the alt text to alt="CQ Logo by Sun-U Choe". It’s a tiny detail, but it ensures screen readers (and search engines) associate the creator with the work.
+
+---
+
+can you modify tmp.py to do this
+
+2. Asset Metadata (The "Invisible" Credit)
+
+If someone forks your repo or copies the image, the README credit might get lost.
+
+    SVG (if applicable): If cq_logo.png is an SVG, open it in a text editor and ensure there’s a <metadata> tag or a comment at the top with the copyright info.
+
+    PNG: You can add a "Copyright" metadata tag to the file itself using standard photo editors or exiftool.
+
+---
+
+done, is it on?
+
+---
+
+commit
