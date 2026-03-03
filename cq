@@ -5,7 +5,7 @@ set -euo pipefail
 # A Claude Code wrapper that spawns haiku sub-agents to explore codebases.
 # Designed to be called by a coding agent's Bash tool to offload code understanding.
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 REPO_RAW_URL="https://raw.githubusercontent.com/kywch/cq/main"
 
 # Resolve the real path of this script (follows symlinks)
@@ -123,6 +123,14 @@ DIAGRAM_PROMPT='
 If the answer involves architecture, data flow, call chains, or component relationships,
 include a mermaid diagram. Skip the diagram for simple lookups (e.g. "where is X defined?").
 Keep diagrams small — under 20 lines.'
+
+WIKI_PROMPT_HEADER='
+## Pre-loaded project context
+The following context was loaded from the project wiki/ directory.
+Use it as a starting point — it may contain an architectural overview, module
+descriptions, or static-analysis results. You should still verify claims against
+the actual source code, but this context can guide your exploration and help you
+find the right files faster.'
 
 INTERACTIVE_PROMPT='
 ## Interactive session
@@ -252,6 +260,45 @@ validate_env() {
   fi
 }
 
+# Load wiki context if wiki/ directory exists in the target project
+load_wiki_context() {
+  local wiki_dir="$TARGET_DIR/wiki"
+  [[ -d "$wiki_dir" ]] || return 0
+
+  local wiki_text=""
+
+  # Pre-load overview.md if it exists (most valuable high-level context)
+  if [[ -f "$wiki_dir/overview.md" ]]; then
+    local content
+    content=$(head -c 20000 "$wiki_dir/overview.md")
+    wiki_text="${wiki_text}
+### overview.md
+${content}"
+  fi
+
+  # List other wiki files so the agent knows they exist
+  local other_files=""
+  while IFS= read -r -d '' f; do
+    local relpath="${f#"$wiki_dir/"}"
+    [[ "$relpath" == "overview.md" ]] && continue
+    other_files="${other_files}
+- wiki/${relpath}"
+  done < <(find "$wiki_dir" -type f -print0 2>/dev/null | sort -z)
+
+  if [[ -n "$other_files" ]]; then
+    wiki_text="${wiki_text}
+
+### Other wiki files available (read with Read tool if relevant)
+${other_files}"
+  fi
+
+  if [[ -n "$wiki_text" ]]; then
+    WIKI_CONTEXT="${WIKI_PROMPT_HEADER}
+${wiki_text}"
+    printf '\e[2mloaded wiki/overview.md as project context\e[0m\n' >&2
+  fi
+}
+
 # Build the system prompt
 setup_prompt() {
   PROMPT="${CUSTOM_SYSTEM_PROMPT:-$SYSTEM_PROMPT}"
@@ -261,6 +308,10 @@ setup_prompt() {
   if [[ "$INTERACTIVE" == true ]]; then
     PROMPT="${PROMPT}${INTERACTIVE_PROMPT}"
   fi
+  # Append wiki context (loaded separately so it comes after all instruction sections)
+  if [[ -n "${WIKI_CONTEXT:-}" ]]; then
+    PROMPT="${PROMPT}${WIKI_CONTEXT}"
+  fi
 }
 
 # Resolve to absolute path
@@ -268,6 +319,8 @@ TARGET_DIR="$(cd "$TARGET_DIR" && pwd)"
 PROJECT_NAME=$(basename "$TARGET_DIR")
 
 validate_env
+WIKI_CONTEXT=""
+load_wiki_context
 setup_prompt
 
 # Progress indicator (prints to stderr, won't pollute stdout)
